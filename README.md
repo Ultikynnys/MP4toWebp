@@ -12,5 +12,5 @@ Depends: vcpkg-cmake-get-vars, vcpkg-pkgconfig-get-modules
 Architecture: x64-windows
 Multi-Arch: same
 
-FFMPEG 7.1 Version source code distributed as is required in the form of a submodule
+FFMPEG 7.1 Version source code distributed as is required in the repo
 
