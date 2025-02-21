@@ -19,23 +19,13 @@ Console Application that converts MP4 to WebP.
 - **Scaling:** Supports user-defined scaling of the input video.
 - **Progress Indicator:** Displays a real-time progress bar showing conversion percentage, frame count, and file size.
 
----
+### Showcase
 
-## Dependencies
+#### Drag MP4 files directly to the executable
+![](https://raw.githubusercontent.com/Ultikynnys/MP4toWebp/refs/heads/main/Show1.webp)
 
-- **FFmpeg Libraries:**
-  - `libavformat`
-  - `libavcodec`
-  - `libswscale`
-  - `libavutil`
-
-- **WebP Libraries:**
-  - `libwebp` (for encoding and muxing)
-
-- **C++17:** Required for threading and filesystem operations.
-
-- **Platform-Specific Requirements:**
-  - **Windows:** Uses Windows-specific APIs (`Windows.h`, `Shlwapi.h`) and requires FFmpeg DLLs (e.g., `avcodec-61.dll`, `avformat-61.dll`, etc.) to be available in the designated `dlls` folder.
+#### Or Use the CLI
+![](https://raw.githubusercontent.com/Ultikynnys/MP4toWebp/refs/heads/main/Show2.webp)
 
 ---
 
@@ -78,13 +68,7 @@ Convert `sample.mkv` to an animated WebP with custom parameters:
 MP4toWebp sample.mkv output.webp -q 75 -l -f 24 --method 4 --target_size 2 --scale 0.5
 ```
 
-### Showcase
 
-#### Drag MP4 files directly to the executable
-![](https://raw.githubusercontent.com/Ultikynnys/MP4toWebp/refs/heads/main/Show1.webp)
-
-#### Or Use the CLI
-![](https://raw.githubusercontent.com/Ultikynnys/MP4toWebp/refs/heads/main/Show2.webp)
 
 ---
 
