@@ -1,6 +1,3 @@
 [submodule "FFMPEG"]
 	path = FFMPEG
 	url = https://git.ffmpeg.org/ffmpeg.git
-[submodule "LIBWEBP"]
-	path = LIBWEBP
-	url = https://chromium.googlesource.com/webm/libwebp
