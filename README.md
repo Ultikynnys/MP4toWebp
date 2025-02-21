@@ -80,7 +80,11 @@ MP4toWebp sample.mkv output.webp -q 75 -l -f 24 --method 4 --target_size 2 --sca
 
 ### Showcase
 
+#### Drag MP4 files directly to the executable
+![](https://raw.githubusercontent.com/Ultikynnys/MP4toWebp/refs/heads/main/Show1.webp)
 
+#### Or Use the CLI
+![](https://raw.githubusercontent.com/Ultikynnys/MP4toWebp/refs/heads/main/Show2.webp)
 
 ---
 
