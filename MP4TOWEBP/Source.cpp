@@ -1,8 +1,31 @@
+#ifdef _WIN32
+#include <Windows.h>
+#include <Shlwapi.h>
+#pragma comment(lib, "Shlwapi.lib")
+// Enable delay-loading for FFmpeg DLLs:
+#pragma comment(linker, "/DELAYLOAD:avcodec-61.dll")
+#pragma comment(linker, "/DELAYLOAD:avformat-61.dll")
+#pragma comment(linker, "/DELAYLOAD:avutil-61.dll")
+#pragma comment(linker, "/DELAYLOAD:swscale-5.dll")
+#endif
+
 #include <iostream>
 #include <cstdio>
 #include <cstdint>
 #include <cstdlib>
+#include <cstring>
 #include <string>
+#include <vector>
+#include <algorithm>
+#include <thread>
+#include <mutex>
+#include <queue>
+#include <condition_variable>
+#include <functional>
+#include <atomic>
+#include <filesystem>
+#include <cmath>    // for round()
+namespace fs = std::filesystem;
 
 extern "C" {
     // FFmpeg headers
@@ -12,23 +35,263 @@ extern "C" {
 #include <libavutil/imgutils.h>
 }
 
-#include <src/webp/encode.h>
-#include <src/webp/mux.h>
+#include <webp/encode.h>
+#include <webp/mux.h>
+
+// Uncomment or define this macro to re-enable clearing the console.
+// When set to 0, the console remains visible.
+#define ENABLE_CLEAR_CONSOLE 0
+
+// Utility: clear the console screen
+void clearConsole() {
+#ifdef _WIN32
+    system("cls");
+#else
+    system("clear");
+#endif
+}
+
+// Print progress bar using time-based progress (output frame count).
+// If ENABLE_CLEAR_CONSOLE is 0 the console will not be cleared.
+void print_progress_bar(double progress, int currentOutputFrame, int expectedOutputFrames,
+    const std::string& inputFile, const std::string& outputFile,
+    int quality, uintmax_t fileSize) {
+    const int barWidth = 50;
+    int pos = static_cast<int>(barWidth * progress);
+
+#if ENABLE_CLEAR_CONSOLE
+    clearConsole();
+#endif
+
+    std::cout << "[";
+    for (int i = 0; i < barWidth; ++i) {
+        if (i < pos)
+            std::cout << "=";
+        else if (i == pos)
+            std::cout << ">";
+        else
+            std::cout << " ";
+    }
+    std::cout << "] " << static_cast<int>(progress * 100.0) << "%  ";
+    std::cout << "Output Frame: " << currentOutputFrame << " / " << expectedOutputFrames << "\n";
+    std::cout << "Filesize: " << (static_cast<double>(fileSize) / (1024.0 * 1024.0)) << " MB\n";
+    std::cout << "Input: " << inputFile << "\nOutput: " << outputFile;
+    std::cout << "\nQuality: " << quality << "\n";
+    std::cout.flush();
+}
+
+// Print help message.
+void print_help(const char* progName) {
+    std::cout << "Usage: " << progName << " <input.mp4|input.mkv> [output.webp] [options]\n\n";
+    std::cout << "Description:\n";
+    std::cout << "  Converts an input video file (MP4 or MKV) into an animated WebP file.\n";
+    std::cout << "  If only an input file is provided, the output file is generated with a '.webp' extension.\n\n";
+    std::cout << "Basic Options (optional, defaults in parentheses):\n";
+    std::cout << "  -q, --quality <value>       Set quality (0-100, default 80).\n";
+    std::cout << "  -l, --lossless              Enable lossless encoding (default is lossy).\n";
+    std::cout << "  -f, --framerate <value>     Set output framerate in FPS (default 30).\n";
+    std::cout << "  --thread_level <value>      Set extra thread level for WebP encoder (default 0).\n";
+    std::cout << "  --method <value>            Set quality/speed trade-off for WebP (0=fast, 6=slower-better, default 0).\n";
+    std::cout << "  --target_size <value>       Set target file size in MB (converted internally to bytes, default 0).\n";
+    std::cout << "  --scale <value>             Set scale factor for input video (default 1.0).\n\n";
+    std::cout << "Example Usage:\n";
+    std::cout << "  " << progName << " sample.mkv output.webp -q 75 -l -f 24 --method 4 --target_size 2 --scale 0.5\n";
+}
+
+// Structures for frame data.
+struct FrameData {
+    int timestamp;              // Output timestamp in ms.
+    std::vector<uint8_t> rgba;  // RGBA pixel data.
+    int id;                   // Unique id for the original frame.
+};
+
+struct ConvertedFrame {
+    int origTimestamp;
+    std::vector<uint8_t> rgba;
+    int id;                   // Unique id assigned to the original frame.
+};
+
+// Global atomic counter for original frame IDs.
+std::atomic<int> originalFrameCounter{ 0 };
+
+// ----- Thread Pool Implementation -----
+class ThreadPool {
+public:
+    ThreadPool(size_t numThreads);
+    ~ThreadPool();
+
+    // Enqueue a task into the pool.
+    void enqueue(std::function<void()> task);
+    // Wait for all tasks to complete.
+    void wait();
+
+private:
+    std::vector<std::thread> workers;
+    std::queue<std::function<void()>> tasks;
+
+    std::mutex queue_mutex;
+    std::condition_variable condition;
+    bool stop;
+
+    std::mutex wait_mutex;
+    std::condition_variable wait_condition;
+    std::atomic<int> tasks_in_progress;
+};
+
+ThreadPool::ThreadPool(size_t numThreads)
+    : stop(false), tasks_in_progress(0) {
+    for (size_t i = 0; i < numThreads; ++i) {
+        workers.emplace_back([this]() {
+            // Each worker thread creates its own sws context and conversion buffer on first use.
+            thread_local SwsContext* local_sws_ctx = nullptr;
+            thread_local std::vector<uint8_t> local_buffer;
+            thread_local AVFrame* local_rgba = nullptr;
+            for (;;) {
+                std::function<void()> task;
+                {
+                    std::unique_lock<std::mutex> lock(this->queue_mutex);
+                    this->condition.wait(lock, [this]() { return this->stop || !this->tasks.empty(); });
+                    if (this->stop && this->tasks.empty())
+                        return;
+                    task = std::move(this->tasks.front());
+                    this->tasks.pop();
+                    tasks_in_progress++;
+                }
+                task();
+                tasks_in_progress--;
+                wait_condition.notify_all();
+            }
+            });
+    }
+}
+
+ThreadPool::~ThreadPool() {
+    {
+        std::unique_lock<std::mutex> lock(queue_mutex);
+        stop = true;
+    }
+    condition.notify_all();
+    for (std::thread& worker : workers)
+        worker.join();
+}
+
+void ThreadPool::enqueue(std::function<void()> task) {
+    {
+        std::unique_lock<std::mutex> lock(queue_mutex);
+        tasks.push(std::move(task));
+    }
+    condition.notify_one();
+}
+
+void ThreadPool::wait() {
+    std::unique_lock<std::mutex> lock(wait_mutex);
+    wait_condition.wait(lock, [this]() {
+        std::unique_lock<std::mutex> lock2(queue_mutex);
+        return tasks.empty() && (tasks_in_progress.load() == 0);
+        });
+}
+
+// ----- End Thread Pool Implementation -----
+
+// Helper function to "reset" a WebPPicture: free previous allocations and reinitialize it.
+bool ResetPicture(WebPPicture* picture) {
+    WebPPictureFree(picture);
+    return WebPPictureInit(picture);
+}
 
 int main(int argc, char* argv[]) {
-    if (argc < 3) {
-        std::cerr << "Usage: " << argv[0] << " <input.mp4> <output.webp>\n";
+#ifdef _WIN32
+    // Set the DLL search directory relative to the executable.
+    wchar_t exePath[MAX_PATH];
+    if (GetModuleFileNameW(NULL, exePath, MAX_PATH) == 0) {
+        std::wcerr << L"Failed to get executable path.\n";
         return -1;
     }
+    if (!PathRemoveFileSpecW(exePath)) {
+        std::wcerr << L"Failed to remove file name from executable path.\n";
+        return -1;
+    }
+    wchar_t dllPath[MAX_PATH];
+    wcscpy_s(dllPath, exePath);
+    if (!PathAppendW(dllPath, L"dlls")) {
+        std::wcerr << L"Failed to append 'dlls' to executable path.\n";
+        return -1;
+    }
+    if (!SetDllDirectoryW(dllPath)) {
+        std::wcerr << L"Failed to set DLL directory to " << dllPath << L"\n";
+        return -1;
+    }
+#endif
 
-    const char* input_filename = argv[1];
-    const char* output_filename = argv[2];
+    if (argc < 2) {
+        std::cerr << "Error: Insufficient arguments.\n";
+        print_help(argv[0]);
+        return -1;
+    }
+    std::string inputFilename = argv[1];
+    std::string outputFilename;
+    if (argc > 2 && argv[2][0] != '-') {
+        outputFilename = argv[2];
+    }
+    else {
+        size_t dotPos = inputFilename.find_last_of(".");
+        outputFilename = (dotPos != std::string::npos) ? inputFilename.substr(0, dotPos) + ".webp"
+            : inputFilename + ".webp";
+    }
 
-    // NOTE: av_register_all() is deprecated in recent FFmpeg versions.
-    // av_register_all();
+    // Default options.
+    int quality = 80;
+    bool lossless = false;
+    int outputFramerate = 30;
+    int extra_thread_level = -1;
+    int method = 0;           // quality/speed trade-off.
+    int target_size = 0;      // in bytes.
+    double scale = 0.5;       // scale factor.
 
+    int optionIndex = (argc > 2 && argv[2][0] != '-') ? 3 : 2;
+    for (int i = optionIndex; i < argc; i++) {
+        if (strcmp(argv[i], "-h") == 0 || strcmp(argv[i], "--help") == 0) {
+            print_help(argv[0]);
+            return 0;
+        }
+        else if (strcmp(argv[i], "-q") == 0 || strcmp(argv[i], "--quality") == 0) {
+            if (i + 1 < argc) { quality = std::atoi(argv[++i]); }
+            else { std::cerr << "Error: Missing value for quality.\n"; return -1; }
+        }
+        else if (strcmp(argv[i], "-l") == 0 || strcmp(argv[i], "--lossless") == 0) {
+            lossless = true;
+        }
+        else if (strcmp(argv[i], "-f") == 0 || strcmp(argv[i], "--framerate") == 0) {
+            if (i + 1 < argc) {
+                outputFramerate = std::atoi(argv[++i]);
+                if (outputFramerate <= 0) { std::cerr << "Error: Framerate must be positive.\n"; return -1; }
+            }
+            else { std::cerr << "Error: Missing value for framerate.\n"; return -1; }
+        }
+        else if (strcmp(argv[i], "--thread_level") == 0) {
+            if (i + 1 < argc) { extra_thread_level = std::atoi(argv[++i]); }
+            else { std::cerr << "Error: Missing value for --thread_level.\n"; return -1; }
+        }
+        else if (strcmp(argv[i], "--method") == 0) {
+            if (i + 1 < argc) { method = std::atoi(argv[++i]); }
+            else { std::cerr << "Error: Missing value for --method.\n"; return -1; }
+        }
+        else if (strcmp(argv[i], "--target_size") == 0) {
+            if (i + 1 < argc) {
+                int mb = std::atoi(argv[++i]);
+                target_size = mb * 1024 * 1024;
+            }
+            else { std::cerr << "Error: Missing value for --target_size.\n"; return -1; }
+        }
+        else if (strcmp(argv[i], "--scale") == 0) {
+            if (i + 1 < argc) { scale = std::atof(argv[++i]); }
+            else { std::cerr << "Error: Missing value for --scale.\n"; return -1; }
+        }
+    }
+
+    // Open input file using FFmpeg.
     AVFormatContext* fmt_ctx = nullptr;
-    if (avformat_open_input(&fmt_ctx, input_filename, nullptr, nullptr) < 0) {
+    if (avformat_open_input(&fmt_ctx, inputFilename.c_str(), nullptr, nullptr) < 0) {
         std::cerr << "Error opening input file.\n";
         return -1;
     }
@@ -36,8 +299,6 @@ int main(int argc, char* argv[]) {
         std::cerr << "Error finding stream info.\n";
         return -1;
     }
-
-    // Find the first video stream
     int video_stream_index = -1;
     for (unsigned int i = 0; i < fmt_ctx->nb_streams; i++) {
         if (fmt_ctx->streams[i]->codecpar->codec_type == AVMEDIA_TYPE_VIDEO) {
@@ -49,8 +310,6 @@ int main(int argc, char* argv[]) {
         std::cerr << "No video stream found.\n";
         return -1;
     }
-
-    // Open the codec
     AVCodecParameters* codecpar = fmt_ctx->streams[video_stream_index]->codecpar;
     const AVCodec* codec = avcodec_find_decoder(codecpar->codec_id);
     if (!codec) {
@@ -62,6 +321,9 @@ int main(int argc, char* argv[]) {
         std::cerr << "Could not allocate codec context.\n";
         return -1;
     }
+    // Enable frame-level threading if possible.
+    codec_ctx->thread_count = std::thread::hardware_concurrency();
+    codec_ctx->thread_type = FF_THREAD_FRAME;
     if (avcodec_parameters_to_context(codec_ctx, codecpar) < 0) {
         std::cerr << "Could not copy codec parameters.\n";
         return -1;
@@ -70,135 +332,272 @@ int main(int argc, char* argv[]) {
         std::cerr << "Could not open codec.\n";
         return -1;
     }
+    // Calculate new dimensions based on scale factor.
+    int origWidth = codec_ctx->width;
+    int origHeight = codec_ctx->height;
+    int scaledWidth = static_cast<int>(origWidth * scale);
+    int scaledHeight = static_cast<int>(origHeight * scale);
 
-    // Prepare to read frames
-    AVFrame* frame = av_frame_alloc();
-    AVPacket* packet = av_packet_alloc();
-
-    // Set up a conversion context to convert the frame to RGBA
-    SwsContext* sws_ctx = sws_getContext(
-        codec_ctx->width, codec_ctx->height, codec_ctx->pix_fmt,
-        codec_ctx->width, codec_ctx->height, AV_PIX_FMT_RGBA,
-        SWS_BILINEAR, nullptr, nullptr, nullptr
+    // Create a main sws context for later use with scaled dimensions.
+    SwsContext* sws_ctx_main = sws_getContext(
+        origWidth, origHeight, codec_ctx->pix_fmt,
+        scaledWidth, scaledHeight, AV_PIX_FMT_RGBA,
+        SWS_FAST_BILINEAR, nullptr, nullptr, nullptr
     );
-    if (!sws_ctx) {
+    if (!sws_ctx_main) {
         std::cerr << "Could not initialize the conversion context.\n";
         return -1;
     }
 
-    // Allocate an AVFrame for the RGBA data
-    AVFrame* frame_rgba = av_frame_alloc();
-    if (!frame_rgba) {
-        std::cerr << "Could not allocate RGBA frame.\n";
-        return -1;
-    }
-    int num_bytes = av_image_get_buffer_size(AV_PIX_FMT_RGBA, codec_ctx->width, codec_ctx->height, 1);
-    uint8_t* rgba_buffer = (uint8_t*)av_malloc(num_bytes * sizeof(uint8_t));
-    if (!rgba_buffer) {
-        std::cerr << "Could not allocate buffer.\n";
-        return -1;
-    }
-    av_image_fill_arrays(frame_rgba->data, frame_rgba->linesize, rgba_buffer,
-        AV_PIX_FMT_RGBA, codec_ctx->width, codec_ctx->height, 1);
-
-    // Initialize WebP animation encoder options and encoder
+    // Setup WebP animation encoder with scaled dimensions.
     WebPAnimEncoderOptions enc_options;
     if (!WebPAnimEncoderOptionsInit(&enc_options)) {
         std::cerr << "Could not initialize WebP animation encoder options.\n";
         return -1;
     }
-    WebPAnimEncoder* encoder = WebPAnimEncoderNew(codec_ctx->width, codec_ctx->height, &enc_options);
+    WebPAnimEncoder* encoder = WebPAnimEncoderNew(scaledWidth, scaledHeight, &enc_options);
     if (!encoder) {
         std::cerr << "Could not create WebP animation encoder.\n";
         return -1;
     }
-
-    // Initialize WebP configuration (quality, etc.)
     WebPConfig config;
     if (!WebPConfigInit(&config)) {
         std::cerr << "Could not initialize WebP config.\n";
         return -1;
     }
-    // Optionally adjust config.quality (e.g., config.quality = 75;)
+    config.quality = quality;
+    config.lossless = lossless ? 1 : 0;
+    config.method = method;
+    config.target_size = target_size;
+    config.thread_level = (extra_thread_level >= 0) ? extra_thread_level : 0;
+    if (!WebPValidateConfig(&config)) {
+        std::cerr << "Invalid WebP config. Please try a different set of options.\n";
+        return -1;
+    }
 
-    // Calculate the time base in milliseconds for frame timestamps
-    double time_base = av_q2d(fmt_ctx->streams[video_stream_index]->time_base);
+    // Calculate total duration (ms) from the global format context.
+    int total_duration_ms = (fmt_ctx->duration > 0) ? fmt_ctx->duration / 1000 : 0;
+    int expectedOutputFrames = (total_duration_ms > 0) ? (total_duration_ms / (1000 / outputFramerate)) + 1 : 0;
+    uintmax_t fileSize = fs::file_size(inputFilename);
 
-    // Read frames from the video
+    // Compute the input frame rate.
+    double inputFPS = av_q2d(fmt_ctx->streams[video_stream_index]->r_frame_rate);
+
+    // --- Debug Information: Always Visible ---
+    std::cout << "DEBUG: Input FPS: " << inputFPS << "\n";
+    std::cout << "DEBUG: Output FPS: " << outputFramerate << "\n";
+    double frameInterval = 1000.0 / outputFramerate; // in ms per frame.
+    std::cout << "DEBUG: Frame Interval (ms): " << frameInterval << "\n";
+    // -------------------------------------------
+
+    std::vector<ConvertedFrame> convertedFrames;
+    std::mutex framesMutex;
+
+    // Create a thread pool using available hardware threads.
+    size_t poolSize = std::thread::hardware_concurrency();
+    if (poolSize == 0)
+        poolSize = 4;
+    ThreadPool pool(poolSize);
+
+    AVPacket* packet = av_packet_alloc();
+    AVFrame* frame = av_frame_alloc();
+    if (!packet || !frame) {
+        std::cerr << "Could not allocate packet or frame.\n";
+        return -1;
+    }
+
+    // Lambda for processing a frame.
+    auto process_frame = [&, codec_ctx, time_base = av_q2d(fmt_ctx->streams[video_stream_index]->time_base),
+        origWidth, origHeight, scaledWidth, scaledHeight](AVFrame* localFrame, int64_t pts) {
+        int origTimestamp = static_cast<int>(pts * time_base * 1000);
+        // Assign a unique id for this original frame.
+        int frameId = originalFrameCounter.fetch_add(1);
+        // Each thread reuses its thread_local sws context and conversion buffer.
+        thread_local SwsContext* local_sws_ctx = nullptr;
+        thread_local std::vector<uint8_t> local_buffer;
+        thread_local AVFrame* local_rgba = nullptr;
+        if (!local_sws_ctx) {
+            local_sws_ctx = sws_getContext(
+                origWidth, origHeight, codec_ctx->pix_fmt,
+                scaledWidth, scaledHeight, AV_PIX_FMT_RGBA,
+                SWS_FAST_BILINEAR, nullptr, nullptr, nullptr
+            );
+            if (!local_sws_ctx) {
+                std::cerr << "Could not create local sws context in thread.\n";
+                av_frame_free(&localFrame);
+                return;
+            }
+        }
+        int num_bytes = av_image_get_buffer_size(AV_PIX_FMT_RGBA, scaledWidth, scaledHeight, 1);
+        if (local_buffer.size() != static_cast<size_t>(num_bytes)) {
+            local_buffer.resize(num_bytes);
+        }
+        if (!local_rgba) {
+            local_rgba = av_frame_alloc();
+            if (!local_rgba) {
+                std::cerr << "Could not allocate local RGBA frame.\n";
+                av_frame_free(&localFrame);
+                return;
+            }
+        }
+        av_image_fill_arrays(local_rgba->data, local_rgba->linesize, local_buffer.data(),
+            AV_PIX_FMT_RGBA, scaledWidth, scaledHeight, 1);
+        sws_scale(local_sws_ctx,
+            localFrame->data,
+            localFrame->linesize,
+            0,
+            origHeight,
+            local_rgba->data,
+            local_rgba->linesize);
+        std::vector<uint8_t> rgbaVec(local_buffer.begin(), local_buffer.end());
+        {
+            std::lock_guard<std::mutex> lock(framesMutex);
+            convertedFrames.push_back(ConvertedFrame{ origTimestamp, std::move(rgbaVec), frameId });
+        }
+        av_frame_free(&localFrame);
+        };
+
+    // Decode and process frames.
     while (av_read_frame(fmt_ctx, packet) >= 0) {
         if (packet->stream_index == video_stream_index) {
             if (avcodec_send_packet(codec_ctx, packet) == 0) {
                 while (avcodec_receive_frame(codec_ctx, frame) == 0) {
-                    // Convert the frame to RGBA
-                    sws_scale(
-                        sws_ctx,
-                        frame->data,
-                        frame->linesize,
-                        0,
-                        codec_ctx->height,
-                        frame_rgba->data,
-                        frame_rgba->linesize
-                    );
-
-                    // Calculate timestamp in milliseconds
                     int64_t pts = (frame->pts == AV_NOPTS_VALUE) ? 0 : frame->pts;
-                    int timestamp = static_cast<int>(pts * time_base * 1000);
-
-                    // Prepare a WebPPicture for the frame data
-                    WebPPicture picture;
-                    if (!WebPPictureInit(&picture)) {
-                        std::cerr << "Could not initialize WebP picture.\n";
-                        return -1;
-                    }
-                    picture.width = codec_ctx->width;
-                    picture.height = codec_ctx->height;
-
-                    // Import the RGBA data into the WebP picture
-                    if (!WebPPictureImportRGBA(&picture, frame_rgba->data[0], frame_rgba->linesize[0])) {
-                        std::cerr << "Failed to import RGBA data.\n";
-                        WebPPictureFree(&picture);
-                        continue; // Skip this frame
-                    }
-
-                    // Add the frame to the WebP animation encoder
-                    if (!WebPAnimEncoderAdd(encoder, &picture, timestamp, &config)) {
-                        std::cerr << "Failed to add a frame to the WebP encoder.\n";
-                    }
-                    WebPPictureFree(&picture);
+                    int current_time_ms = static_cast<int>(pts * av_q2d(fmt_ctx->streams[video_stream_index]->time_base) * 1000);
+                    int currentOutputFrame = (1000 / outputFramerate > 0) ? (current_time_ms / (1000 / outputFramerate)) + 1 : 0;
+                    double progress = (total_duration_ms > 0) ? static_cast<double>(current_time_ms) / total_duration_ms : 0.0;
+                    if (progress > 1.0)
+                        progress = 1.0;
+                    print_progress_bar(progress, currentOutputFrame, expectedOutputFrames,
+                        inputFilename, outputFilename, quality, fileSize);
+                    AVFrame* frame_copy = av_frame_clone(frame);
+                    pool.enqueue([frame_copy, pts, process_frame]() {
+                        process_frame(frame_copy, pts);
+                        });
                 }
             }
         }
         av_packet_unref(packet);
     }
+    // Flush decoder.
+    if (avcodec_send_packet(codec_ctx, nullptr) == 0) {
+        while (avcodec_receive_frame(codec_ctx, frame) == 0) {
+            int64_t pts = (frame->pts == AV_NOPTS_VALUE) ? 0 : frame->pts;
+            int current_time_ms = static_cast<int>(pts * av_q2d(fmt_ctx->streams[video_stream_index]->time_base) * 1000);
+            int currentOutputFrame = (1000 / outputFramerate > 0) ? (current_time_ms / (1000 / outputFramerate)) + 1 : 0;
+            double progress = (total_duration_ms > 0) ? static_cast<double>(current_time_ms) / total_duration_ms : 0.0;
+            if (progress > 1.0)
+                progress = 1.0;
+            print_progress_bar(progress, currentOutputFrame, expectedOutputFrames,
+                inputFilename, outputFilename, quality, fileSize);
+            AVFrame* frame_copy = av_frame_clone(frame);
+            pool.enqueue([frame_copy, pts, process_frame]() {
+                process_frame(frame_copy, pts);
+                });
+        }
+    }
+    pool.wait();
+    av_frame_free(&frame);
+    av_packet_free(&packet);
 
-    // Assemble the animated WebP
+    // Sort frames based on original timestamp.
+    std::sort(convertedFrames.begin(), convertedFrames.end(), [](const ConvertedFrame& a, const ConvertedFrame& b) {
+        return a.origTimestamp < b.origTimestamp;
+        });
+
+    // ----- Optimized Sampling Step with Correct Frame Timing -----
+    std::vector<FrameData> framesData;
+    if (inputFPS < outputFramerate) {
+        // Uniformly distribute original frames.
+        size_t totalFrames = convertedFrames.size();
+        for (size_t i = 0; i < totalFrames; i++) {
+            int outTimestamp = (totalFrames > 1) ? static_cast<int>(std::round(i * total_duration_ms / static_cast<double>(totalFrames - 1))) : 0;
+            framesData.push_back(FrameData{ outTimestamp, std::move(convertedFrames[i].rgba), convertedFrames[i].id });
+        }
+    }
+    else {
+        // Sample frames based on fixed frame interval.
+        double nextFrameTime = 0.0;
+        int outputFrameCount = 0;
+        for (auto& cf : convertedFrames) {
+            if (cf.origTimestamp >= nextFrameTime) {
+                int outTimestamp = static_cast<int>(std::round(outputFrameCount * frameInterval));
+                framesData.push_back(FrameData{ outTimestamp, std::move(cf.rgba), cf.id });
+                outputFrameCount++;
+                nextFrameTime += frameInterval;
+            }
+        }
+    }
+    // ----- End Optimized Sampling Step -----
+
+    // Add frames to the WebP animation.
+    WebPPicture picture;
+    if (!WebPPictureInit(&picture)) {
+        std::cerr << "Could not initialize WebP picture.\n";
+        return -1;
+    }
+    picture.width = scaledWidth;
+    picture.height = scaledHeight;
+    picture.use_argb = 1;
+
+    int totalOutputFramesFinal = framesData.size();
+    int frameIndex = 0;
+    for (const auto& fd : framesData) {
+        std::cout << "Adding frame " << (frameIndex + 1) << " of " << totalOutputFramesFinal
+            << " at " << fd.timestamp << " ms, id: " << fd.id << "...\n";
+        size_t expectedSize = static_cast<size_t>(scaledWidth * scaledHeight * 4);
+        if (fd.rgba.size() != expectedSize) {
+            std::cerr << "Warning: Expected buffer size " << expectedSize
+                << " but got " << fd.rgba.size() << ".\n";
+        }
+        if (!ResetPicture(&picture)) {
+            std::cerr << "Could not reset WebP picture for frame " << frameIndex << ".\n";
+            frameIndex++;
+            continue;
+        }
+        picture.width = scaledWidth;
+        picture.height = scaledHeight;
+        picture.use_argb = 1;
+        if (!WebPPictureImportRGBA(&picture, fd.rgba.data(), scaledWidth * 4)) {
+            std::cerr << "Failed to import RGBA data for frame at timestamp " << fd.timestamp << " ms, id: " << fd.id << ".\n";
+            frameIndex++;
+            continue;
+        }
+        if (!WebPAnimEncoderAdd(encoder, &picture, fd.timestamp, &config)) {
+            std::cerr << "Failed to add a frame at timestamp " << fd.timestamp << " ms, id: " << fd.id << ".\n";
+        }
+        frameIndex++;
+    }
+    WebPPictureFree(&picture);
+
     WebPData webp_data;
     WebPDataInit(&webp_data);
     if (!WebPAnimEncoderAssemble(encoder, &webp_data)) {
-        std::cerr << "Failed to assemble WebP animation.\n";
+        std::cerr << "\nFailed to assemble WebP animation.\n";
         return -1;
     }
 
-    // Write the WebP data to the output file
     FILE* out_file = nullptr;
-    if (fopen_s(&out_file, output_filename, "wb") != 0) {
+#ifdef _WIN32
+    if (fopen_s(&out_file, outputFilename.c_str(), "wb") != 0) {
         std::cerr << "Could not open output file for writing.\n";
         return -1;
     }
+#else
+    out_file = fopen(outputFilename.c_str(), "wb");
+    if (!out_file) {
+        std::cerr << "Could not open output file for writing.\n";
+        return -1;
+    }
+#endif
     std::fwrite(webp_data.bytes, webp_data.size, 1, out_file);
     std::fclose(out_file);
-    std::cout << "Conversion complete. Output saved to " << output_filename << "\n";
+    std::cout << "\nConversion complete. Output saved to " << outputFilename << "\n";
 
-    // Clean up resources
     WebPAnimEncoderDelete(encoder);
     WebPDataClear(&webp_data);
-    av_free(rgba_buffer);
-    av_frame_free(&frame);
-    av_frame_free(&frame_rgba);
-    av_packet_free(&packet);
+    sws_freeContext(sws_ctx_main);
     avcodec_free_context(&codec_ctx);
     avformat_close_input(&fmt_ctx);
-    sws_freeContext(sws_ctx);
-
     return 0;
 }
