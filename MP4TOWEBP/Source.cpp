@@ -12,9 +12,8 @@ extern "C" {
 #include <libavutil/imgutils.h>
 }
 
-#include <webp/encode.h>
-#include <webp/anim_encode.h>
-#include <webp/mux.h>
+#include <src/webp/encode.h>
+#include <src/webp/mux.h>
 
 int main(int argc, char* argv[]) {
     if (argc < 3) {
@@ -25,8 +24,9 @@ int main(int argc, char* argv[]) {
     const char* input_filename = argv[1];
     const char* output_filename = argv[2];
 
-    // Initialize FFmpeg
-    av_register_all();
+    // NOTE: av_register_all() is deprecated in recent FFmpeg versions.
+    // av_register_all();
+
     AVFormatContext* fmt_ctx = nullptr;
     if (avformat_open_input(&fmt_ctx, input_filename, nullptr, nullptr) < 0) {
         std::cerr << "Error opening input file.\n";
@@ -52,7 +52,7 @@ int main(int argc, char* argv[]) {
 
     // Open the codec
     AVCodecParameters* codecpar = fmt_ctx->streams[video_stream_index]->codecpar;
-    AVCodec* codec = avcodec_find_decoder(codecpar->codec_id);
+    const AVCodec* codec = avcodec_find_decoder(codecpar->codec_id);
     if (!codec) {
         std::cerr << "Unsupported codec.\n";
         return -1;
@@ -98,7 +98,8 @@ int main(int argc, char* argv[]) {
         std::cerr << "Could not allocate buffer.\n";
         return -1;
     }
-    av_image_fill_arrays(frame_rgba->data, frame_rgba->linesize, rgba_buffer, AV_PIX_FMT_RGBA, codec_ctx->width, codec_ctx->height, 1);
+    av_image_fill_arrays(frame_rgba->data, frame_rgba->linesize, rgba_buffer,
+        AV_PIX_FMT_RGBA, codec_ctx->width, codec_ctx->height, 1);
 
     // Initialize WebP animation encoder options and encoder
     WebPAnimEncoderOptions enc_options;
@@ -118,7 +119,7 @@ int main(int argc, char* argv[]) {
         std::cerr << "Could not initialize WebP config.\n";
         return -1;
     }
-    // Optionally, adjust the configuration (e.g., config.quality = 75;)
+    // Optionally adjust config.quality (e.g., config.quality = 75;)
 
     // Calculate the time base in milliseconds for frame timestamps
     double time_base = av_q2d(fmt_ctx->streams[video_stream_index]->time_base);
@@ -143,10 +144,27 @@ int main(int argc, char* argv[]) {
                     int64_t pts = (frame->pts == AV_NOPTS_VALUE) ? 0 : frame->pts;
                     int timestamp = static_cast<int>(pts * time_base * 1000);
 
-                    // Add the RGBA frame to the WebP animation encoder
-                    if (!WebPAnimEncoderAdd(encoder, frame_rgba->data[0], frame_rgba->linesize[0], timestamp, &config)) {
+                    // Prepare a WebPPicture for the frame data
+                    WebPPicture picture;
+                    if (!WebPPictureInit(&picture)) {
+                        std::cerr << "Could not initialize WebP picture.\n";
+                        return -1;
+                    }
+                    picture.width = codec_ctx->width;
+                    picture.height = codec_ctx->height;
+
+                    // Import the RGBA data into the WebP picture
+                    if (!WebPPictureImportRGBA(&picture, frame_rgba->data[0], frame_rgba->linesize[0])) {
+                        std::cerr << "Failed to import RGBA data.\n";
+                        WebPPictureFree(&picture);
+                        continue; // Skip this frame
+                    }
+
+                    // Add the frame to the WebP animation encoder
+                    if (!WebPAnimEncoderAdd(encoder, &picture, timestamp, &config)) {
                         std::cerr << "Failed to add a frame to the WebP encoder.\n";
                     }
+                    WebPPictureFree(&picture);
                 }
             }
         }
@@ -162,8 +180,8 @@ int main(int argc, char* argv[]) {
     }
 
     // Write the WebP data to the output file
-    FILE* out_file = std::fopen(output_filename, "wb");
-    if (!out_file) {
+    FILE* out_file = nullptr;
+    if (fopen_s(&out_file, output_filename, "wb") != 0) {
         std::cerr << "Could not open output file for writing.\n";
         return -1;
     }
